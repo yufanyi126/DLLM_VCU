@@ -1,0 +1,72 @@
+[
+  {
+    "route_description": "Home to Office (Morning)",
+    "traffic_condition": "smooth",
+    "driving_condition": "highway_cruise",
+    "driver_style": "normal",
+    "soc": 0.85,
+    "speed": 90.0,
+    "gear": "D",
+    "throttle_angle": 35.0,
+    "battery_temp": 26.0,
+    "latitude": 39.91,
+    "longitude": 116.41,
+    "timestamp": "2026-06-29 08:00:00"
+  },
+  {
+    "route_description": "Downtown Area",
+    "traffic_condition": "congested",
+    "driving_condition": "urban_congested",
+    "driver_style": "conservative",
+    "soc": 0.65,
+    "speed": 20.0,
+    "gear": "D",
+    "throttle_angle": 15.0,
+    "battery_temp": 30.0,
+    "latitude": 39.92,
+    "longitude": 116.43,
+    "timestamp": "2026-06-29 08:30:00"
+  },
+  {
+    "route_description": "Suburb to Office",
+    "traffic_condition": "smooth",
+    "driving_condition": "suburban",
+    "driver_style": "aggressive",
+    "soc": 0.55,
+    "speed": 70.0,
+    "gear": "D",
+    "throttle_angle": 60.0,
+    "battery_temp": 28.0,
+    "latitude": 39.88,
+    "longitude": 116.35,
+    "timestamp": "2026-06-29 09:00:00"
+  },
+  {
+    "route_description": "Mountain Road Trip",
+    "traffic_condition": "smooth",
+    "driving_condition": "mountain",
+    "driver_style": "normal",
+    "soc": 0.45,
+    "speed": 50.0,
+    "gear": "D",
+    "throttle_angle": 45.0,
+    "battery_temp": 32.0,
+    "latitude": 40.05,
+    "longitude": 116.55,
+    "timestamp": "2026-06-29 10:00:00"
+  },
+  {
+    "traffic_condition": "smooth",
+    "driving_condition": "highway_cruise",
+    "driver_style": "aggressive",
+    "soc": 0.4,
+    "speed": 120.0,
+    "gear": "D",
+    "throttle_angle": 70.0,
+    "battery_temp": 35.0,
+    "latitude": 39.95,
+    "longitude": 116.5,
+    "timestamp": "2026-06-29 10:30:00",
+    "route_description": "High Speed Highway"
+  }
+]

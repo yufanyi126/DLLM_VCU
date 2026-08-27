@@ -1,0 +1,76 @@
+VERSION ""
+
+
+NS_ : 
+	NS_DESC_
+	CM_
+	BA_DEF_
+	BA_
+	VAL_
+	CAT_DEF_
+	CAT_
+	FILTER
+	BA_DEF_DEF_
+	EV_DATA_
+	ENVVAR_DATA_
+	SGTYPE_
+	SGTYPE_VAL_
+	BA_DEF_SGTYPE_
+	BA_SGTYPE_
+	SIG_TYPE_REF_
+	VAL_TABLE_
+	SIG_GROUP_
+	SIG_VALTYPE_
+	SIGTYPE_VALTYPE_
+	BO_TX_BU_
+	BA_DEF_REL_
+	BA_REL_
+	BA_DEF_DEF_REL_
+	BU_SG_REL_
+	BU_EV_REL_
+	BU_BO_REL_
+	SG_MUL_VAL_
+
+BS_:
+
+BU_:
+
+
+BO_ 552 CMM_228: 8 Vector__XXX
+ SG_ EFCMNT_PDLE_ACCEL_228 : 23|8@0+ (0.5,0) [0|100] "" Vector__XXX
+
+BO_ 632 CMM_278: 8 Vector__XXX
+ SG_ EFCMNT_PDLE_ACCEL_278 : 47|8@0+ (0.5,0) [0|100] "" Vector__XXX
+
+BO_ 1506 VCU_5E2: 8 Vector__XXX
+ SG_ STDE_DRV_ENGY_MODE_STATE : 36|3@0+ (1,0) [0|7] "" Vector__XXX
+ SG_ STDE_DRV_DYN_MODE_STATE : 39|3@0+ (1,0) [0|7] "" Vector__XXX
+
+BO_ 1442 VCU_5A2: 8 Vector__XXX
+ SG_ HV_BATT_SOC : 49|10@0+ (0.1,0) [0|100] "%" Vector__XXX
+ SG_ HV_BATT_TEMP_MAX : 46|7@0+ (1,-40) [-40|85] "degC" Vector__XXX
+
+BO_ 1298 V2_BSI_512: 8 Vector__XXX
+ SG_ TBD : 0|1@0+ (1,0) [0|0] "" Vector__XXX
+ SG_ STDE_DRV_ENGY_MODE_REQ : 4|3@0+ (1,0) [0|7] "" Vector__XXX
+ SG_ STDE_DRV_DYN_MODE_REQ : 7|3@0+ (1,0) [0|7] "" Vector__XXX
+ SG_ STDE_MODE_REQ_BIT_TGL : 1|1@0+ (1,0) [0|1] "" Vector__XXX
+
+BO_ 1278 ESM_4FE: 8 Vector__XXX
+ SG_ POS_MONOSTABLE_LEVER : 15|3@0+ (1,0) [0|7] "-" Vector__XXX
+
+BO_ 909 ABR_38D: 8 Vector__XXX
+ SG_ VITESSE_VEHICULE_ROUES : 7|16@0+ (0.01,0) [0|655.35] "kmh" Vector__XXX
+
+BO_ 1314 E_VCU_522: 8 Vector__XXX
+ SG_ HV_BATT_TEMP_AVG : 39|8@0+ (1,-40) [0|0] "degC" Vector__XXX
+
+BO_ 1240 DAT_CMM_4D8: 8 Vector__XXX
+ SG_ HV_BATT_REAL_CURR_HD : 7|16@0- (0.1,0) [-2000|2000] "A" Vector__XXX
+ SG_ HV_BATT_REAL_VOLT_HD : 23|14@0+ (0.1,0) [0|1000] "V" Vector__XXX
+
+
+
+BA_DEF_  "BusType" STRING ;
+BA_DEF_DEF_  "BusType" "CAN";
+

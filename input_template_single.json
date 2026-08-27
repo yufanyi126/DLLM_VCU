@@ -1,0 +1,14 @@
+{
+  "route_description": "City Center to Airport",
+  "traffic_condition": "smooth",
+  "driving_condition": "highway_cruise",
+  "driver_style": "normal",
+  "soc": 0.7,
+  "speed": 80.0,
+  "gear": "D",
+  "throttle_angle": 40.0,
+  "battery_temp": 28.0,
+  "latitude": 39.9042,
+  "longitude": 116.4074,
+  "timestamp": "2026-06-29 10:00:00"
+}
