@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 from itertools import cycle  
 import matplotlib.animation as animation
 import numpy as np
+import sys
 
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False

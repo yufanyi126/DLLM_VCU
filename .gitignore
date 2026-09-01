@@ -26,3 +26,6 @@ venv/
 # OS
 Thumbs.db
 Desktop.ini
+
+# RMS 调试导出 CSV（可选开关开启时临时生成，不入库）
+RMS/captured/

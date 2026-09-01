@@ -1,8 +1,34 @@
-langgraph>=0.4.0
-openai>=1.0.0
-python-dotenv>=1.0.0
-pydantic>=2.0.0
-websockets>=12.0
-requests>=2.31.0
-cantools>=39.0.0
-pyserial>=3.5
+# ============================================================
+# DLLM_VCU_V3.2 依赖清单（由 .venv311 实际环境核对后补全）
+# 环境要求：Python 3.11.x（必须是 3.11，因为 portrait_core 是 cp311 编译）
+# 安装：pip install -r requirements.txt
+# ============================================================
+
+# ---- 核心 AI / Agent ----
+langgraph==1.2.11
+openai==3.3.1
+pydantic==2.13.4
+python-dotenv==1.2.3
+
+# ---- 网络 / 通信 ----
+websockets==16.1.1
+requests==2.34.2
+httpx==0.28.1
+
+# ---- CAN 总线 / 串口 ----
+cantools==42.0.3
+python-can==4.6.1
+pyserial==3.5
+
+# ---- 数据处理 / 数值计算 ----
+pandas==2.3.3
+numpy==1.26.4
+pyarrow==25.0.1
+
+# ---- 图像 / 绘图 ----
+matplotlib==3.11.1
+pillow==12.3.0
+
+# ---- 工具库 ----
+pyyaml==6.0.3
+tqdm==4.70.0

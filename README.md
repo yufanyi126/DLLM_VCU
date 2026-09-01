@@ -1,2 +1,0 @@
-# DLLM_VCU
-AIVCU code

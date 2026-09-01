@@ -293,7 +293,7 @@ class RouteTracker:
 
     # ========== 辅助方法 ==========
 
-    def reload_steps(self, new_steps, lat=None, lon=None):
+    def reload_steps(self, new_steps, lat=None, lon=None, keep_prefix=0):
         """
         API 刷新后重新加载路段列表，通过 GPS 坐标在新路线上重新定位。
 
@@ -301,24 +301,41 @@ class RouteTracker:
             new_steps: 新的路段列表（与 __init__ 格式相同）
             lat:       当前纬度，用于 GPS 重新定位
             lon:       当前经度，用于 GPS 重新定位
+            keep_prefix: 保留旧路线中已完成的段数（从头部保留），拼在新路线前面。
+                         保留段保持原 step_index，新段 step_index 从 keep_prefix 起递增，
+                         使段号全程连续，已采集的运行时数据不丢失。
         """
         if not new_steps:
             return
 
-        self.steps = new_steps
+        # ---- 方案 B：保留已完成段，拼接剩余新段 ----
+        prefix = []
+        if keep_prefix and keep_prefix > 0:
+            prefix = self.steps[:keep_prefix]
+        merged = list(prefix) + list(new_steps)
+
+        # 新段 step_index 重新编号，从 keep_prefix 起，保证 sequence 连续
+        for i, s in enumerate(new_steps):
+            s = dict(s)  # 避免修改外部传入的原始对象
+            s['step_index'] = keep_prefix + i
+            new_steps[i] = s
+        merged = list(prefix) + list(new_steps)
+
+        self.steps = merged
         self._step_points = None  # 清除 polyline 缓存
 
         if lat is not None and lon is not None:
-            # GPS 重新定位：在新路线上找到最近的路段
+            # GPS 重新定位：在完整路线上找到最近的路段
             self.current_step_idx = 0  # 临时重置，让 _find_nearest_step 做全路线搜索
             new_idx = self._find_nearest_step(lat, lon)
-            self.current_step_idx = new_idx
+            # 重新定位结果不能落在已完成段之前（避免回退到已走过的段）
+            self.current_step_idx = max(new_idx, len(prefix))
             self.distance_in_step = 0.0
         else:
             # 无 GPS 坐标时的降级方案：保持旧索引在合理范围内
             old_idx = self.current_step_idx
-            if old_idx >= len(new_steps):
-                self.current_step_idx = len(new_steps) - 1
+            if old_idx >= len(merged):
+                self.current_step_idx = len(merged) - 1
                 self.distance_in_step = 0.0
             else:
                 self.current_step_idx = old_idx
@@ -329,6 +346,27 @@ class RouteTracker:
 
         # 同步更新总距离，避免与新路线脱节
         self.original_total_distance = sum(s['distance'] for s in self.steps) if self.steps else 0.0
+
+    def update_traffic(self, new_steps, completed):
+        """
+        API 路况刷新（仅更新剩余段路况，不替换路线几何、不改段数/段索引/总距离）。
+
+        适用前提：全程按初次规划路线行驶、未偏航。新 API 结果是从当前位置到终点的
+        重新规划路线，这里只按顺序把其剩余段的 traffic 覆盖到 self.steps[completed:] 上，
+        保持段列表长度恒等于初次段数，从而避免分母随刷新次数无限增长。
+
+        参数:
+            new_steps: 新的路段列表（从当前位置到终点的完整重规划路线）
+            completed: 已完成段数（self.steps 中已完成段的数量）
+        """
+        if not new_steps:
+            return
+        # 只覆盖剩余段 [completed:] 的 traffic 字段，其余字段一律不动
+        for i, ns in enumerate(new_steps):
+            j = completed + i
+            if j < len(self.steps):
+                self.steps[j]['traffic'] = ns.get('traffic', self.steps[j].get('traffic', ''))
+        # 注意：current_step_idx / distance_in_step / original_total_distance 均保持不变
 
     def is_finished(self):
         """是否已走完所有路段。"""

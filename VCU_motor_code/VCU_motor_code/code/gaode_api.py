@@ -127,7 +127,7 @@ def get_driving_direction(**params):
                        2: 距离优先
                        10: 躲避拥堵 & 速度优先
                        32: 大路优先
-        waypoints:     途经点坐标，多个用"|"分隔（可选）
+        waypoints:     途经点坐标，多个用";"分隔（高德 V5 规范，可选；最大 16 个）
         show_fields:   返回字段控制，如 "cost,polyline"（可选）
         **params:      其他自定义参数，会自动添加到请求中
 

@@ -136,6 +136,7 @@ def rule_decide(state: dict) -> dict:
     speed = state.get("speed", 0)
     traffic = state.get("traffic_condition", "unknown")
     driving = state.get("driving_condition", "urban")
+
     style = state.get("driver_style", "normal")
     throttle = state.get("throttle_angle", 0)
     bt = state.get("battery_temp", 25)

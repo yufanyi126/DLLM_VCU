@@ -1,4 +1,4 @@
-﻿# coding:UTF-8
+# coding:UTF-8
 """
     receive_demo.py — 远程上位机 AI 决策程序
     ==========================================
@@ -16,9 +16,10 @@ import os
 import asyncio
 import json
 import re
-import time
+import threading
 from datetime import datetime
 import websockets
+
 
 # ===== 网络与运行开关集中配置（部署时优先通过环境变量覆盖）=====
 # 车端 WebSocket 服务地址；receive_demo 主动连接该 IP 来获取车辆侧 output_data。
@@ -36,23 +37,28 @@ CAR_PORT = DEFAULT_CAR_PORT
 # LLM/DeepSeek 调用耗时不可控，客户端也关闭自动 ping，避免等待决策时断线。
 WS_PING_INTERVAL = None
 WS_PING_TIMEOUT = None
-# 决策模式开关：0=正常运行 Agent/AI 决策，1=固定输出预设模式，2=按预设列表循环输出。
-# 也可以通过环境变量 VCU_DECISION_MODE 覆盖该值。
-DECISION_MODE_SWITCH = int(os.environ.get("VCU_DECISION_MODE", "2"))  # 0=Agent/AI, 1=fixed preset, 2=loop presets
+# 决策模式开关：0=调用 LLM，1=固定输出“混动 + 舒适”。
+# 也可以通过环境变量 VCU_FIXED_DECISION 覆盖该值。
+FIXED_DECISION_SWITCH = 0  #int(os.environ.get("VCU_FIXED_DECISION", "0"))
 # 现有车端协议中，舒适驾驶模式对应 standard。
-FIXED_ENERGY_MODE = "hybrid"  # fixed preset energy_mode: hybrid/hev=0, pure_ev/ev=1
-FIXED_DRIVING_MODE = "standard"  # fixed preset driving_mode: standard=0, sport=1, eco=2
+FIXED_ENERGY_MODE = "hybrid"    #hybrid
+FIXED_DRIVING_MODE = "standard" #standard
 
-# Loop output mode presets. Edit this list to change the loop sequence.
-LOOP_DECISION_PRESETS = [
-    {"energy_mode": "hybrid", "driving_mode": "standard"},
-    {"energy_mode": "hybrid", "driving_mode": "sport"},
-    # {"energy_mode": "pure_ev", "driving_mode": "eco"},
+# ===== 固定决策轮换模拟（测试 TGL 翻转用）=====
+# FIXED_CYCLE_SWITCH=1 时，每收到一帧车端数据就轮换一次模式组合，
+# 模拟上位机决策结果变化，让车端 STDE_MODE_REQ_BIT_TGL 能观察到翻转。
+FIXED_CYCLE_SWITCH = int(os.environ.get("VCU_FIXED_CYCLE", "1"))
+# 轮换序列：(energy_mode, driving_mode)，对应 decision_to_control 映射
+FIXED_MODE_CYCLE = [
+    ("hybrid", "standard"),   # engy=0, dyn=0
+    ("pure_ev", "standard"),  # engy=1, dyn=0  ← ENGY 变化 → TGL 翻转
+    ("pure_ev", "sport"),     # engy=1, dyn=1  ← DYN 变化 → TGL 翻转
+    ("pure_ev", "sport"),     # engy=1, dyn=1  ← 不变     → TGL 不变
+    ("hybrid", "sport"),      # engy=0, dyn=1  ← ENGY 变化 → TGL 翻转
+    ("hybrid", "eco"),        # engy=0, dyn=2  ← DYN 变化 → TGL 翻转
 ]
-LOOP_DECISION_INTERVAL_SECONDS = float(os.environ.get("VCU_LOOP_DECISION_INTERVAL", "30"))  # default loop interval: 15s
-LOOP_DECISION_START_TIME = None
-
-
+_FIXED_CYCLE_LOCK = threading.Lock()
+_FIXED_CYCLE_STATE = {"frame": 0, "energy": FIXED_ENERGY_MODE, "driving": FIXED_DRIVING_MODE}
 # =========================================
 
 
@@ -98,9 +104,13 @@ def _parse_number(value, default=0.0):
 
 
 def _soc_to_ratio(value, default=0.5):
-    """The decision agent expects SOC in 0.0-1.0, while CAN payload uses percent."""
+    """The decision agent expects SOC in 0.0-1.0, while CAN payload uses percent.
+    Clamp to [0,1] so abnormal out-of-range SOC (e.g. model bug sends >100) never
+    propagates an impossible ratio into the decision agent."""
     soc = _parse_number(value, default * 100)
-    return soc / 100 if soc > 1 else soc
+    # 兼容两种来源：>1 视为百分比，<=1 视为已是小数
+    ratio = soc / 100 if soc > 1 else soc
+    return min(max(ratio, 0.0), 1.0)
 
 
 def validate_output_data(output):
@@ -183,17 +193,40 @@ def _fallback_snapshot(output):
     }
 
 
+# RMS 画像词汇表（与 RMS/接口说明书.md 的 driving_style / driving_scenario 枚举一致）
+_RMS_STYLES = {"conservative", "normal", "aggressive", "very_aggressive"}
+_RMS_SCENARIOS = {"highway_cruise", "elevated_cruise", "urban_congested",
+                  "urban_smooth", "suburban", "mountain"}
+
+# RMS 输出词汇 -> 决策规则（llm_stdlib.rule_decide）可命中的归一化映射
+# very_aggressive 在 rule_decide 里没有分支，需归一到 aggressive 才会触发激进风格；
+# elevated_cruise / urban_congested 不在 rule_decide 的 d_map 里，分别归一到
+# highway_cruise / urban_smooth，让高架巡航与拥堵场景语义不丢失。
+_STYLE_NORM = {"very_aggressive": "aggressive"}
+_SCENARIO_NORM = {"elevated_cruise": "highway_cruise", "urban_congested": "urban_smooth"}
+
+
 def segment_to_agent_input(seg, output):
     """Convert one main.py segment into the normalized decision-agent input schema."""
     fallback = _fallback_snapshot(output)
     # Pending segments have no live CAN/GPS values, so use the current vehicle
     # snapshot while keeping their own route, instruction, distance, and traffic.
     route_text = seg.get("route") or seg.get("instruction") or f"segment {seg.get('sequence', '')}"
+    rms = output.get("rms") or {}
+    rms_style = rms.get("style")
+    rms_scenario = rms.get("scenario")
+    # 先把 RMS 原始词汇归一化为 rule_decide 可识别的词
+    if rms_style in _STYLE_NORM:
+        rms_style = _STYLE_NORM[rms_style]
+    if rms_scenario in _SCENARIO_NORM:
+        rms_scenario = _SCENARIO_NORM[rms_scenario]
     return {
         "route_description": route_text,
         "traffic_condition": _traffic_to_agent(seg.get("traffic")),
-        "driving_condition": _driving_condition_for_segment(seg),
-        "driver_style": "normal",
+        # 优先用 RMS 驾驶画像；无有效画像时回退到按路名/交通推断
+        "driving_condition": (rms_scenario if rms_scenario in _RMS_SCENARIOS
+                              else _driving_condition_for_segment(seg)),
+        "driver_style": rms_style if rms_style in _RMS_STYLES else "normal",
         "soc": _soc_to_ratio(seg.get("soc") or fallback["soc"]),
         "speed": float(seg.get("speed") if seg.get("speed") is not None else fallback["speed"]),
         "gear": seg.get("gear") or fallback["gear"],
@@ -218,57 +251,33 @@ def _local_decide(state):
     return decision if decision is not None else rule_decide(state)
 
 
-def _fixed_decision(energy_mode, driving_mode, label):
-    control = decision_to_control({
-        "energy_mode": energy_mode,
-        "driving_mode": driving_mode,
-    })
-    if control is None:
-        raise ValueError(f"unsupported decision preset: {energy_mode} + {driving_mode}")
-    return {
-        "energy_mode": energy_mode,
-        "driving_mode": driving_mode,
-        "energy_signal": control["engy_mode"],
-        "drive_signal": control["dyn_mode"],
-        "reasoning": f"[{label}] preset output: {energy_mode} + {driving_mode}",
-    }
-
-
-def _loop_decision_preset():
-    global LOOP_DECISION_START_TIME
-    if not LOOP_DECISION_PRESETS:
-        return {"energy_mode": FIXED_ENERGY_MODE, "driving_mode": FIXED_DRIVING_MODE}
-    if LOOP_DECISION_START_TIME is None:
-        LOOP_DECISION_START_TIME = time.monotonic()
-    interval = LOOP_DECISION_INTERVAL_SECONDS if LOOP_DECISION_INTERVAL_SECONDS > 0 else 15
-    elapsed = max(0.0, time.monotonic() - LOOP_DECISION_START_TIME)
-    index = int(elapsed // interval) % len(LOOP_DECISION_PRESETS)
-    return LOOP_DECISION_PRESETS[index]
-
-
-def _reset_loop_decision_cycle():
-    global LOOP_DECISION_START_TIME
-    LOOP_DECISION_START_TIME = time.monotonic()
-
-
 def call_decision_agent(state):
     """
     根据开关选择 LLM 决策或固定决策。
 
     接收数据和决策 packet 回传流程不受影响；开关只控制决策内容来源。
     """
-    if DECISION_MODE_SWITCH == 1:
-        return _fixed_decision(FIXED_ENERGY_MODE, FIXED_DRIVING_MODE, "Fixed")
+    if FIXED_DECISION_SWITCH == 1:
+        if FIXED_CYCLE_SWITCH == 1:
+            # 轮换模拟：读取 build_decision_packet 每帧更新好的当前模式
+            with _FIXED_CYCLE_LOCK:
+                energy = _FIXED_CYCLE_STATE["energy"]
+                driving = _FIXED_CYCLE_STATE["driving"]
+                frame = _FIXED_CYCLE_STATE["frame"]
+            reasoning = f"[Fixed-Cycle] 帧{frame}: {energy} + {driving}（模拟变化）"
+        else:
+            energy, driving = FIXED_ENERGY_MODE, FIXED_DRIVING_MODE
+            reasoning = "[Fixed] 固定输出：混动 + 舒适（standard）"
+        return {
+            "energy_mode": energy,
+            "driving_mode": driving,
+            # 基准: receive_demo.py decision_to_control() → hybrid=0, standard=0
+            "energy_signal": 0,
+            "drive_signal": 0,
+            "reasoning": reasoning,
+        }
 
-    if DECISION_MODE_SWITCH == 2:
-        preset = _loop_decision_preset()
-        return _fixed_decision(
-            preset.get("energy_mode", FIXED_ENERGY_MODE),
-            preset.get("driving_mode", FIXED_DRIVING_MODE),
-            "Loop",
-        )
-
-    # DECISION_MODE_SWITCH = 0: normal Agent/AI decision.
+    # 开关为 0 时恢复原有 LLM/规则兜底决策。
     return _local_decide(state)
 
 
@@ -344,6 +353,15 @@ def build_decision_packet(output):
         print(f"[AI] invalid output_data, skip decision: {reason}")
         return None
 
+    # 固定决策轮换模拟：每帧数据切换一次模式组合，使车端 TGL 能体现翻转
+    if FIXED_DECISION_SWITCH == 1 and FIXED_CYCLE_SWITCH == 1:
+        with _FIXED_CYCLE_LOCK:
+            idx = _FIXED_CYCLE_STATE["frame"] % len(FIXED_MODE_CYCLE)
+            _FIXED_CYCLE_STATE["energy"], _FIXED_CYCLE_STATE["driving"] = FIXED_MODE_CYCLE[idx]
+            _FIXED_CYCLE_STATE["frame"] += 1
+            print(f"[AI] 模拟轮换帧{_FIXED_CYCLE_STATE['frame']}: "
+                  f"{_FIXED_CYCLE_STATE['energy']} + {_FIXED_CYCLE_STATE['driving']}")
+
     # main.py 每帧发送完整 output_data。AI 对全路段逐段决策，但只把当前路段
     # 的控制命令下发给车端，避免提前应用未来路段的模式。
     current, current_seg = _current_segment(output)
@@ -401,36 +419,13 @@ def run_receive_test():
     print(f"[TEST] 本机 IP: {LOCAL_IP}")
     print("[TEST] Agent 调用方式: 直接导入 vcu_agent.llm_stdlib")
     print("[TEST] 已阻断真实 WebSocket 发送，仅测试接收数据和 Agent 输出")
-    if DECISION_MODE_SWITCH == 2:
-        _reset_loop_decision_cycle()
-        print(
-            f"[TEST] 循环输出已启用：每 {LOOP_DECISION_INTERVAL_SECONDS:g} 秒切换一个预设，"
-            f"共 {len(LOOP_DECISION_PRESETS)} 个预设。按 Ctrl+C 停止。"
-        )
-
-    frame_index = 0
-    last_packet = None
-    while True:
-        valid, reason = validate_output_data(test_payload)
-        if not valid:
-            print(f"[TEST] 仿真 output_data 结构错误: {reason}")
-            return last_packet or []
-
-        if DECISION_MODE_SWITCH == 2:
-            preset = _loop_decision_preset()
-            print(
-                f"[TEST] 第 {frame_index + 1} 次输出："
-                f"{preset.get('energy_mode')} + {preset.get('driving_mode')}"
-            )
-
-        last_packet = build_decision_packet(test_payload)
-        emit_decision_packet(last_packet, prefix="[TEST]")
-        frame_index += 1
-
-        if DECISION_MODE_SWITCH != 2:
-            return last_packet
-
-        time.sleep(max(0.0, LOOP_DECISION_INTERVAL_SECONDS))
+    valid, reason = validate_output_data(test_payload)
+    if not valid:
+        print(f"[TEST] 仿真 output_data 结构错误: {reason}")
+        return []
+    packet = build_decision_packet(test_payload)
+    emit_decision_packet(packet, prefix="[TEST]")
+    return packet
 
 
 async def host_main(host=CAR_HOST, port=CAR_PORT):
@@ -441,16 +436,14 @@ async def host_main(host=CAR_HOST, port=CAR_PORT):
     """
     ws_url = f"ws://{host}:{port}"
     reconnect_delay = 3  # 重连间隔（秒）
-    if DECISION_MODE_SWITCH == 2:
-        _reset_loop_decision_cycle()
 
     while True:
         try:
             print(f"[上位机] 正在连接车载端: {ws_url} ...")
             async with websockets.connect(
-                    ws_url,
-                    ping_interval=WS_PING_INTERVAL,
-                    ping_timeout=WS_PING_TIMEOUT,
+                ws_url,
+                ping_interval=WS_PING_INTERVAL,
+                ping_timeout=WS_PING_TIMEOUT,
             ) as ws:
                 print(f"[上位机] 已连接到车载端")
 

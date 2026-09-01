@@ -14,7 +14,16 @@ import random
 import re
 import platform
 import threading
+_threading_Lock = threading.Lock  # 别名，供段画像线程安全写 session['rms_result']
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+
+# ========== Simulink 未建模信号模拟池 ==========
+# Simulink 模型当前未输出电池电流/电压/最高温度，先用随机值垫着。
+# 当 can_signals 中已存在该键（真实 CAN 路径）时不会覆盖。
+_SIM_BAT_CURRENT_POOL = [-50.0, -30.0, 0.0, 25.0, 60.0, 120.0, 180.0]   # 电池电流 (A)，含放电/充电
+_SIM_BAT_VOLTAGE_POOL = [320.0, 350.0, 380.0, 400.0, 420.0]             # 电池电压 (V)
+_SIM_BAT_TEMP_MAX_POOL = [25.0, 30.0, 35.0, 40.0, 45.0, 50.0]           # 电池最高温度 (degC)
 
 # ========== 路径配置 ==========
 _BASE = os.path.dirname(__file__)
@@ -31,6 +40,9 @@ sys.path.insert(0, _CHS_DIR)
 
 # 将 CANLan 目录加入搜索路径（zlgcan, CANFDNET）
 sys.path.insert(0, os.path.join(_BASE, 'CANLan'))
+
+# 将 RMS 目录加入搜索路径（portrait_core 驾驶画像模型）
+sys.path.insert(0, os.path.join(_BASE, 'RMS'))
 
 from sensor_reader import SensorReader
 from gaode_api import (
@@ -65,6 +77,22 @@ SIMULATED_SPEEDS = [           # 模拟车速列表 (km/h)，会随机选一个
 SPEED_CHANGE_INTERVAL = 5.0    # 每隔多少秒更换一次随机速度
 # ============================
 
+# ---------- RMS 分段落盘采样降频 ----------
+CSV_SAMPLE_GAP_SEC = 10        # 分段落盘降采样间隔（秒）：每 10 秒只取 1 帧写入落盘缓冲
+# ---------- RMS 调试 CSV 导出开关 ----------
+# RMS 保存 CSV 开关：
+RMS_EXPORT_CSV = True   # True=开（保存csv到本地文件），False=关（不保存）
+RMS_EXPORT_CSV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "RMS", "captured")
+
+# RMS 画像计算开关（与落盘解耦）：
+# True  = 实时回路仍按段算驾驶画像（AI 收到画像）。
+# False = 完全不跑 RMS（AI 收到 rms_result=None）
+RMS_ENABLED = True   # True=开（算画像），False=关（不算）
+# ---------- RMS 分段落盘（按真实时间跨度，保证窗口时长 ≥ 290s） ----------
+CSV_SEG_TARGET_SEC = 310   # 实时切段目标跨度（秒）：缓冲达到此真实时长才落盘为一段，留 20s 余量远高于 290
+CSV_SEG_MIN_SEC = 290      # 末段最低可接受跨度（秒）：强制 flush 时 ≥ 此值才允许独立成段，否则并入上一段
+# =========================================================
+
 # ---------- HTTP 仪表盘开关 ----------
 # True  = init_session 时启动 HTTP 后台服务（GPS 仪表盘 + API）
 # False = 不启动 HTTP 服务，节省端口资源
@@ -82,16 +110,15 @@ NETWORK_GPS_PORT = 9999         # NetworkReader 监听端口
 # ---------- main 输出数据测试开关 ----------
 # True 时不连接 GPS、CAN 或高德 API，直接向 car_server 提供固定的 output_data。
 # 仅用于手动验证 main -> car_server -> receive_demo -> Agent 的完整链路。
-# 完全不依赖任何硬件/网络/API，用硬编码的假数据跑通整条流程      0是关闭，1是开启
-MAIN_TEST_DATA_SWITCH = os.environ.get("VCU_MAIN_TEST_DATA", "0").lower() in ("1", "true", "yes", "on")
+# 完全不依赖任何硬件/网络/API，用硬编码的假数据跑通整条流程。
+# True = 开（用假数据跑链路），False = 关（连真实 GPS/CAN/高德）
+MAIN_TEST_DATA_SWITCH = False   # True=开，False=关
 # ====================================
 
 
 def is_main_test_data_enabled():
-    """运行时读取测试开关，保证 car_server 导入 main 后再设置开关也能生效。"""
-    return os.environ.get("VCU_MAIN_TEST_DATA", str(MAIN_TEST_DATA_SWITCH)).lower() in (
-        "1", "true", "yes", "on"
-    )
+    """运行时读取测试开关，直接返回常量。"""
+    return MAIN_TEST_DATA_SWITCH
 
 # ---------- CAN 自发自收测试开关 ----------
 # True  = 使用自发自收测试模式（无实车时自动注入模拟 CAN 报文）
@@ -108,7 +135,7 @@ MOCK_CAN = False
 # ---------- Simulink 仿真数据源开关 ----------
 # True  = 车端 CAN 数据从 Simulink 仿真模型获取（替代真实 CAN 盒）
 # False = 车端 CAN 数据从真实 CAN 盒获取  False关闭仿真，True 启动仿真
-USE_SIMULINK = True
+USE_SIMULINK = False
 
 # Simulink TCP 连接参数（与 simulink_code/code/simlink.py 保持一致）
 SIMULINK_RECV_HOST = "127.0.0.1"
@@ -120,7 +147,7 @@ SIMULINK_SEND_PORT = 7000    # 向 Simulink 发送控制指令 (2 double)
 # ---------- 模拟 GPS 开关 ----------
 # True  = 不初始化真实 GPS 传感器，step() 中用内置模拟 GPS 数据
 # False = 通过串口/网络连接真实 GPS 传感器   False 关闭模拟， True 开启模拟
-MOCK_GPS = True
+MOCK_GPS = False
 
 # 模拟 GPS 数据（起点的附近坐标，用于路线跟踪）
 MOCK_GPS_LAT = 29.7165
@@ -254,6 +281,295 @@ def translate_engy_mode(value):
     if value is None:
         return ""
     return ENGY_MODE_MAP.get(int(value), f"未知({value})")
+
+
+def _build_rms_df(window):
+    """
+    把落盘缓冲窗口（list[dict]）转成 RMS 需要的 DataFrame。
+    列名严格对齐 RMS 样例（test01.csv）：
+        ts, speed, voltage, current, soc, accel_pedal, gear, temp_max
+    """
+    import pandas as pd
+    df = pd.DataFrame(window, columns=[
+        'ts', 'speed', 'voltage', 'current', 'soc',
+        'accel_pedal', 'gear', 'temp_max',
+    ])
+    # 数值清洗：缺失值填 0，避免模型 NaN 报错
+    df['speed'] = pd.to_numeric(df['speed'], errors='coerce').fillna(0.0)
+    df['voltage'] = pd.to_numeric(df['voltage'], errors='coerce').fillna(0.0)
+    df['current'] = pd.to_numeric(df['current'], errors='coerce').fillna(0.0)
+    df['soc'] = pd.to_numeric(df['soc'], errors='coerce').fillna(0.0)
+    df['accel_pedal'] = pd.to_numeric(df['accel_pedal'], errors='coerce').fillna(0.0)
+    df['gear'] = pd.to_numeric(df['gear'], errors='coerce').fillna(0.0)
+    df['temp_max'] = pd.to_numeric(df['temp_max'], errors='coerce').fillna(0.0)
+    df['ts'] = pd.to_datetime(df['ts'], unit='s')
+    return df
+
+
+def _seg_ts_str(ts):
+    """段文件名时间戳：YYYYMMDD_HHMMSS（与 _export_rms_window_csv 段模式命名一致）。"""
+    import datetime as _dt
+    _d = _dt.datetime.fromtimestamp(ts)
+    return f"{_d.year}{_d.month:02d}{_d.day:02d}_{_d.hour:02d}{_d.minute:02d}{_d.second:02d}"
+
+
+def _format_rms_csv_df(df):
+    """
+    把喂给模型的窗口 DataFrame 格式化为 CSV 行（一致的列顺序与字段加工）。
+    与 _export_rms_window_csv / _append_to_existing_csv 共用，避免重复逻辑。
+    列顺序：ts, speed, voltage, current, soc, accel_pedal, temp_max
+    """
+    import pandas as pd
+    import datetime as _dt
+    import math
+    df_csv = df.copy()
+    df_csv = df_csv.sort_values('ts').reset_index(drop=True)
+
+    # —— 1) 第一列时间：用缓冲里真实的每帧 ts，格式 2019/3/9 6:46:55 ——
+    def _fmt(t):
+        return f"{t.year}/{t.month}/{t.day} {t.hour}:{t.minute:02d}:{t.second:02d}"
+    df_csv['ts'] = df_csv['ts'].apply(lambda t: _fmt(_dt.datetime.fromtimestamp(pd.Timestamp(t).timestamp())))
+
+    # —— 2) soc：已是百分比（0~100），四舍五入（进位）后写入 ——
+    def _round_half_up(x):
+        return int(math.floor(float(x) + 0.5))
+    df_csv['soc'] = df_csv['soc'].apply(lambda x: _round_half_up(x))
+
+    # —— 2.5) accel_pedal：已是物理量百分比 0~100%，四舍五入（进位）后写入 ——
+    df_csv['accel_pedal'] = df_csv['accel_pedal'].apply(lambda x: _round_half_up(x))
+
+    # —— 3) 去掉 gear 列（不写入 CSV） ——
+    if 'gear' in df_csv.columns:
+        df_csv = df_csv.drop(columns=['gear'])
+
+    # 列顺序对齐模板
+    df_csv = df_csv[['ts', 'speed', 'voltage', 'current', 'soc', 'accel_pedal', 'temp_max']]
+    return df_csv
+
+
+def _export_rms_window_csv(df, res=None, seg_idx=None, seg_start_ts=None):
+    """
+    可选调试导出：把喂给模型的窗口 DataFrame 落盘为 CSV。
+    文件名带时间戳与 style/scenario，方便中途查看真实输入数据。
+    目录：VCU_motor_code/RMS/captured/（不存在则自动创建）
+
+    段模式（seg_idx / seg_start_ts 均非 None）：导出"上一段"累积的全部帧，
+    文件名为 rms_window_segNNN_<段起点时间戳>.csv。
+    兼容模式（二者为 None）：保留原滑动窗口时间戳命名。
+    """
+    try:
+        import datetime as _dt
+        df_csv = _format_rms_csv_df(df)
+
+        os.makedirs(RMS_EXPORT_CSV_DIR, exist_ok=True)
+        if seg_idx is not None and seg_start_ts is not None:
+            # 段模式：文件名体现段序号与段起点时间
+            _d = _dt.datetime.fromtimestamp(seg_start_ts)
+            _seg = f"{_d.year}{_d.month:02d}{_d.day:02d}_{_d.hour:02d}{_d.minute:02d}{_d.second:02d}"
+            fname = f"rms_window_seg{seg_idx:03d}_{_seg}.csv"
+            tag = f"段#{seg_idx}({_seg})"
+        else:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            style = (res or {}).get('style') or 'NA'
+            scenario = (res or {}).get('scenario') or 'NA'
+            safe_style = re.sub(r'[^\w\-]+', '_', str(style))
+            safe_scenario = re.sub(r'[^\w\-]+', '_', str(scenario))
+            fname = f"rms_window_{ts}_{safe_style}_{safe_scenario}.csv"
+            tag = f"模型={style}/{scenario}"
+        fpath = os.path.join(RMS_EXPORT_CSV_DIR, fname)
+        df_csv.to_csv(fpath, index=False, encoding='utf-8-sig')
+        print(f"[RMS][导出] 窗口已落盘: {fpath} (行数={len(df_csv)}, {tag})")
+    except Exception as e:
+        print(f"[RMS][导出] 写 CSV 失败（不影响实时）：{e}")
+
+
+def _append_to_existing_csv(fpath, buf):
+    """
+    把一段缓冲（list[dict]）追加合并进已存在的段 CSV 文件末尾（不含表头），
+    用于末段偏短（<290s）时并入上一段，避免生成不达标短文件。
+    合并后文件行数 = 上一段 + 本段，窗口时长稳过 290s。
+    """
+    try:
+        nd = _format_rms_csv_df(_build_rms_df(buf))
+        # 仅追加数据行（跳过表头）
+        nd.to_csv(fpath, mode='a', index=False, header=False, encoding='utf-8-sig')
+        print(f"[RMS][导出] 末段偏短，已合并进上一段: {fpath} (+{len(nd)} 行)")
+    except Exception as e:
+        print(f"[RMS][导出] 合并到上一段失败（不影响主流程）：{e}")
+
+
+def _maybe_flush_segment_csv(session, now, sample):
+    """
+    分段落盘（方案1：按真实时间跨度累积，保证窗口时长 ≥ 290s）：
+      - 段缓冲累积帧，直到「缓冲末帧.ts − 缓冲首帧.ts ≥ CSV_SEG_TARGET_SEC(310s)」才落盘为一段 CSV，
+        天然保证时长远高于 290s，对中间漏帧/抖动鲁棒。
+      - 段起点 = 缓冲首帧真实 ts（而非程序启动时刻对齐）。
+      - sample 为 None 时（强制 flush，如程序退出）：
+          * 若当前缓冲跨度 ≥ 290s → 导出为新段；
+          * 否则（末段偏短）→ 若已存在上一段文件则合并追加进上一段（上一段已 ≥310s，合并后仍合格），
+            不新建短文件；若连上一段都没有（整段 < 290s）则跳过不导出。
+    """
+    buf = session.setdefault('csv_segment_buffer', [])
+    # 过滤掉缓冲中无 ts 的异常项
+    buf = [s for s in buf if isinstance(s, dict) and 'ts' in s]
+    session['csv_segment_buffer'] = buf
+
+    if sample is not None:
+        buf.append(sample)
+
+    # 计算当前缓冲的真实时间跨度
+    if len(buf) >= 2:
+        span = buf[-1]['ts'] - buf[0]['ts']
+    else:
+        span = 0.0
+
+    force_flush = (sample is None)
+
+    if force_flush:
+        # 程序退出强制落盘
+        if not buf:
+            return
+        if span >= CSV_SEG_MIN_SEC:
+            # 足够长 → 导出为新段（强制 flush 不重算画像，沿用 session 内已有值）
+            _flush_current_segment(session, buf, run_rms=False)
+        else:
+            # 末段偏短：尝试合并进上一段
+            last_path = session.get('csv_last_exported_path')
+            if last_path and os.path.exists(last_path):
+                _append_to_existing_csv(last_path, buf)
+            else:
+                print(f"[RMS][导出] 末段跨度仅 {span:.0f}s(<{CSV_SEG_MIN_SEC}s) 且无上一段，跳过不导出")
+        # 清空缓冲（无论是否导出）
+        session['csv_segment_buffer'] = []
+        return
+
+    # 实时累积：跨度达标才切段导出
+    if span >= CSV_SEG_TARGET_SEC:
+        _flush_current_segment(session, buf, keep_last=sample)
+
+
+# 段画像后台计算线程池（避免 RMS 推理阻塞 step()/事件循环）
+_RMS_THREAD_POOL = None
+
+
+def _get_rms_pool():
+    """懒初始化一个 daemon 线程池，专跑 RMS 段画像计算。"""
+    global _RMS_THREAD_POOL
+    if _RMS_THREAD_POOL is None:
+        import concurrent.futures as _cf
+        _RMS_THREAD_POOL = _cf.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="rms_worker"
+        )
+    return _RMS_THREAD_POOL
+
+
+def _flush_current_segment(session, buf, keep_last=None, run_rms=True):
+    """把当前段缓冲按需落盘 CSV（段起点=缓冲首帧 ts），并按需异步算 RMS 画像。
+    CSV 落盘与 RMS 画像已解耦，二者各自受独立开关控制：
+      - CSV 落盘仅受 RMS_EXPORT_CSV 控制；
+      - RMS 画像受 RMS_ENABLED 控制（直接吃内存 DataFrame，不再读回 CSV）。
+    keep_last 非空时（实时切段），导出后保留该帧作为下一段首帧，避免跨段丢帧。
+    run_rms=True（实时切段）时，提交一次后台 RMS 画像：
+    提交到后台线程，算完再写回 session['rms_result']，因此 step() 不阻塞。
+    代价：本轮 flush 发出的那帧 output 带的仍是上一轮缓存的 rms 值，新画像在下一帧体现。
+    程序退出强制 flush 传 run_rms=False 避免重复计算。"""
+    if not buf:
+        return
+    # —— 落盘 CSV（仅受 CSV 开关控制，与 RMS 无关）——
+    if RMS_EXPORT_CSV:
+        seg_idx = session.get('csv_seg_idx', 0)
+        seg_start_ts = buf[0]['ts']
+        _export_rms_window_csv(_build_rms_df(buf), seg_idx=seg_idx, seg_start_ts=seg_start_ts)
+        session['csv_last_exported_path'] = os.path.join(
+            RMS_EXPORT_CSV_DIR,
+            f"rms_window_seg{seg_idx:03d}_"
+            f"{_seg_ts_str(seg_start_ts)}.csv",
+        )
+        session['csv_seg_idx'] = seg_idx + 1
+    # 重置缓冲：实时切段时保留当前帧作为下一段首帧；强制 flush 时调用方已清空
+    session['csv_segment_buffer'] = [keep_last] if keep_last is not None else []
+
+    # —— RMS 画像（受 RMS_ENABLED 控制，直接吃内存 DataFrame，不依赖 CSV）——
+    if run_rms and RMS_ENABLED:
+        _submit_rms_async(session, _build_rms_df(buf))
+
+
+def _on_rms_done(future, session):
+    """RMS 后台任务回调：把成功画像写回 session['rms_result']（加锁保护）。"""
+    try:
+        _r = future.result()
+    except Exception as e:  # 极端兜底，避免吞掉线程异常打印
+        print(f"[RMS] 后台任务异常（跳过，AI 取 None）: {e}")
+        return
+    if _r is None:
+        return  # 分析未通过/预测失败：保留上一次有效值，不更新
+    _lock = session.setdefault('rms_lock', _threading_Lock())
+    with _lock:
+        session['rms_result'] = _r
+    print(f"[RMS] 段画像更新(异步) -> style={_r['style']}, scenario={_r['scenario']}")
+
+
+def _submit_rms_async(session, df):
+    """把一次 RMS 画像计算提交到后台线程，完成后写回 session。
+    入参 df 为内存中的窗口 DataFrame（已由 _build_rms_df 构造），不再依赖落盘 CSV。"""
+    try:
+        pool = _get_rms_pool()
+        fut = pool.submit(_run_rms_on_df, df)
+        fut.add_done_callback(lambda f: _on_rms_done(f, session))
+    except Exception as e:
+        print(f"[RMS] 提交后台任务失败（同步降级）: {e}")
+        # 降级：同步跑一次，保证画像仍可用（仅在提交异常时触发，正常不会走到）
+        _r = _run_rms_on_df(df)
+        if _r is not None:
+            _lock = session.setdefault('rms_lock', _threading_Lock())
+            with _lock:
+                session['rms_result'] = _r
+
+
+def _update_rms_buffer(session, now, sample):
+    """
+    step() 每帧调用：按 CSV_SAMPLE_GAP_SEC 降采样把样本写入分段落盘缓冲，
+    并按真实时间跨度触发 CSV 落盘。不含实时滑窗画像计算。
+    sample 为 dict: {ts, speed, voltage, current, soc, accel_pedal, gear, temp_max}
+    """
+    # —— 源头降采样：每 CSV_SAMPLE_GAP_SEC 秒只保留 1 帧 ——
+    if now - session.get('last_csv_sample_ts', 0.0) < CSV_SAMPLE_GAP_SEC:
+        return  # 距上一帧不足降采样间隔，跳过
+    session['last_csv_sample_ts'] = now
+
+    # —— 分段落盘：按真实时间跨度累积（≥310s 切段），保证窗口时长 ≥ 290s ——
+    _maybe_flush_segment_csv(session, now, sample)
+
+
+def _run_rms_on_df(df):
+    """
+    对内存中的窗口 DataFrame 跑一次 RMS 驾驶画像（同步、阻塞），返回精简画像或 None（异常/失败）。
+    使用 RMS/rms_call.py 的 analyze_df()；模型不可用（缺 .pyd / 预测失败）时降级为 None，实时回路不受影响。
+    这样无论是否落盘 CSV，画像都直接从内存数据计算，不再读回文件。
+    """
+    try:
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            "rms_call_mod",
+            os.path.join(os.path.dirname(__file__), "RMS", "rms_call.py"),
+        )
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        r = _mod.analyze_df(df, platform='BEV', capacity=60)
+        if not r.get('ok'):
+            print(f"[RMS] 分析未通过（跳过，AI 取 None）: {r}")
+            return None
+        return {
+            'style': r.get('style'),
+            'scenario': r.get('scenario'),
+            'score': r.get('score'),
+            'confidence': r.get('confidence'),
+            'updated_at': time.time(),
+        }
+    except Exception as e:
+        print(f"[RMS] 预测失败（跳过，AI 取 None））: {e}")
+        return None
+
 
 
 def print_sensor_data(data):
@@ -514,6 +830,37 @@ def init_route_with_cache(origin_addr, dest_addr):
     return route_steps, raw_result
 
 
+def _build_waypoints(route_steps, max_points=15):
+    """
+    从初次规划的 route_steps 中提取完整轨迹点，等间隔抽稀成途经点。
+    返回 "lng,lat;lng,lat;..." 字符串（高德 V5 waypoints 格式，分号分隔）。
+    起点/终点已由 origin/destination 指定，故去掉首尾点，只取中间拐点。
+    """
+    pts = []
+    for seg in route_steps:
+        pl = seg.get("polyline", "")
+        if not pl:
+            continue
+        for p in pl.split(";"):
+            p = p.strip()
+            if p:
+                pts.append(p)
+    if len(pts) <= 2:
+        return ""
+    # 去掉首尾（起终点已由 origin/destination 指定），中间抽稀到 max_points 个
+    body = pts[1:-1]
+    if not body:
+        return ""
+    if len(body) <= max_points:
+        chosen = body
+    else:
+        step = len(body) / max_points
+        chosen = [body[int(i * step)] for i in range(max_points)]
+    wp = ";".join(chosen)
+    print(f"  >> 已生成途经点: {len(chosen)} 个（抽稀自 {len(pts)} 个轨迹点）")
+    return wp
+
+
 def _build_segment_states(route_steps):
     """根据 route_steps 构建初始的全路段状态列表，每个路段附带运行时字段"""
     segment_states = []
@@ -558,7 +905,15 @@ def init_session(origin_addr=None, dest_addr=None):
     # 测试模式绕开硬件与地图初始化，让 car_server 能立即发送 main 的模拟输出。
     if is_main_test_data_enabled():
         print("[MAIN TEST] 已启用测试 output_data，不连接 GPS、CAN 或高德 API")
-        return {"test_data": True, "test_frame_index": 0, "finished": False}
+        return {
+            "test_data": True,
+            "test_frame_index": 0,
+            "finished": False,
+            # 分段落盘状态（按真实时间跨度累积，保证窗口时长 ≥ 290s）
+            "csv_seg_idx": 0,                     # 当前段序号 0,1,2...（单调递增）
+            "csv_segment_buffer": [],             # 当前段累积的帧
+            "csv_last_exported_path": None,       # 上一段已导出 CSV 路径（供末段偏短时合并）
+        }
 
     session = {}
 
@@ -648,6 +1003,8 @@ def init_session(origin_addr=None, dest_addr=None):
         return None
     session['route_steps'] = route_steps
     session['raw_result'] = raw_result
+    # 方案2：将初次规划路线抽稀为途经点（waypoints），供后续刷新时钉死路线几何
+    session['route_waypoints'] = _build_waypoints(route_steps, max_points=15)
 
     # ====== 6. 初始化路线跟踪器 ======
     tracker = RouteTracker(route_steps)
@@ -657,6 +1014,12 @@ def init_session(origin_addr=None, dest_addr=None):
     # ====== 7. 初始化运行时状态 ======
     session['last_api_refresh'] = time.time()
     session['finished'] = False
+
+    # ====== 7.1 初始化分段落盘状态（按真实时间跨度累积，保证窗口时长 ≥ 290s） ======
+    session['csv_seg_idx'] = 0                          # 当前段序号 0,1,2...（单调递增）
+    session['csv_segment_buffer'] = []                  # 当前段累积的帧
+    session['csv_last_exported_path'] = None            # 上一段已导出 CSV 路径（供末段合并）
+    session['rms_result'] = None                        # RMS 驾驶画像缓存（style/scenario），由段 CSV 落盘后刷新
 
     # ====== 8. 初始化全路段状态列表 ======
     session['segment_states'] = _build_segment_states(route_steps)
@@ -760,6 +1123,40 @@ def step(session):
         can_signals = sim_client.get_signals() if sim_client else {}
     else:
         can_signals = get_all_signals()
+
+    # ---------- Simulink 未建模信号随机垫值（模型尚未输出，先用模拟值；真实 CAN 路径已含时不覆盖） ----------
+    if "HV_BATT_REAL_CURR_HD" not in can_signals:
+        can_signals["HV_BATT_REAL_CURR_HD"] = random.choice(_SIM_BAT_CURRENT_POOL)
+    if "HV_BATT_REAL_VOLT_HD" not in can_signals:
+        can_signals["HV_BATT_REAL_VOLT_HD"] = random.choice(_SIM_BAT_VOLTAGE_POOL)
+    if "HV_BATT_TEMP_MAX" not in can_signals:
+        can_signals["HV_BATT_TEMP_MAX"] = random.choice(_SIM_BAT_TEMP_MAX_POOL)
+    if "HV_BATT_SOC" not in can_signals:
+        # 仿真未建模/未连接时，垫一个物理量百分比 SOC（如 55.3），与 RMS 要求的 0~100% 对齐
+        can_signals["HV_BATT_SOC"] = round(random.uniform(10.0, 100.0), 1)
+
+    # ---------- Simulink 新模型 0~1 比例信号 → 0~100 百分数归一化 ----------
+    # HV_BATT_SOC / EFCMNT_PDLE_ACCEL 新模型输出为 0~1 比例（如 0.498=49.8%、0.167=16.7%），
+    # 统一转为 0~100 百分数；若已是百分数（垫值 / 真实 CAN）则保持不变。
+    def _to_percent100(raw):
+        if raw is None:
+            return raw
+        try:
+            f = float(raw)
+            if 0.0 <= f <= 1.0:
+                return f * 100.0
+        except (TypeError, ValueError):
+            pass
+        return raw
+
+    can_signals["HV_BATT_SOC"] = _to_percent100(can_signals.get("HV_BATT_SOC"))
+    _accel_raw = can_signals.get("EFCMNT_PDLE_ACCEL_228")
+    if _accel_raw is None:
+        _accel_raw = can_signals.get("EFCMNT_PDLE_ACCEL_278")
+    _accel_pct = _to_percent100(_accel_raw)
+    if _accel_pct is not None:
+        can_signals["EFCMNT_PDLE_ACCEL_228"] = _accel_pct
+
     can_speed = can_signals.get("VITESSE_VEHICULE_ROUES")  # CAN 车速 (km/h)
     can_batt_curr = can_signals.get("HV_BATT_REAL_CURR_HD")  # 电池电流 (A)
     can_batt_volt = can_signals.get("HV_BATT_REAL_VOLT_HD")  # 电池电压 (V)
@@ -808,27 +1205,46 @@ def step(session):
             print(f"            将停止 API 请求，进入航位推算模式...")
             print(f"{'='*50}")
 
-    # ---------- API 路况刷新 ----------
+    # ---------- API 路况刷新（方案2：钉死初次路线几何） ----------
     if now - session['last_api_refresh'] > API_REFRESH_INTERVAL:
-        if gps_valid and lat is not None and lon is not None:
+        if gps_valid:  # GPS 有效时才请求；丢失时不请求（沿用最后有效路况）
             print(f"\n[刷新] 正在更新路况...")
-            print(f"  >> 已调用高德API")
-            origin_coord = f"{lon},{lat}"
+            print(f"  >> 已调用高德API（固定起点 + waypoints 钉死路线）")
+            origin_coord = session['origin_addr']   # 固定为初次起点 A（不再用实时 GPS）
             dest_coord = to_coordinate(dest_addr)
             if dest_coord:
-                new_result = get_driving_direction(
+                req = dict(
                     origin=origin_coord,
                     destination=dest_coord,
                     show_fields="tmcs,cost,polyline",
                 )
+                wp = session.get('route_waypoints', '')
+                if wp:
+                    req['waypoints'] = wp            # 方案2：钉死初次路线几何
+                new_result = get_driving_direction(**req)
                 if new_result and new_result.get("status") == "1":
                     save_route_cache(new_result)
                     route_steps = build_route_steps(new_result)
                     if route_steps:
-                        tracker.reload_steps(route_steps, lat, lon)
-                        session['route_steps'] = route_steps
-                        session['segment_states'] = _build_segment_states(route_steps)
-                        print("[刷新] 路况已更新")
+                        # 段数一致性校验：钉死后返回分段应与初次完全一致
+                        if len(route_steps) == len(tracker.steps):
+                            # 按初次路线行驶：只刷新剩余段路况，不替换路线几何、段数保持不变
+                            completed = tracker.current_step_idx
+                            tracker.update_traffic(route_steps, completed)
+                            # 路线路段列表与段数恒等于初次规划，不扩容
+                            merged_steps = tracker.steps
+                            session['route_steps'] = merged_steps
+                            # 仅更新已完成段之后（剩余段）的 traffic，保持 segment_states 长度稳定
+                            old_states = session.get('segment_states') or []
+                            for i, ns in enumerate(route_steps):
+                                j = completed + i
+                                if j < len(old_states):
+                                    old_states[j]['traffic'] = ns.get('traffic', old_states[j].get('traffic', ''))
+                            session['segment_states'] = old_states
+                            print(f"[刷新] 路况已更新（段数稳定：共 {len(merged_steps)} 段）")
+                        else:
+                            print(f"[刷新] 段数不一致({len(route_steps)} vs {len(tracker.steps)})，"
+                                  f"跳过本次刷新以避免错位")
                     else:
                         print("[刷新] build_route_steps 返回空")
                 else:
@@ -846,7 +1262,9 @@ def step(session):
     can_engy     = translate_engy_mode(can_signals.get("STDE_DRV_ENGY_MODE_STATE"))
     can_soc      = f"{can_signals.get('HV_BATT_SOC', 0):.1f}%" if can_signals.get('HV_BATT_SOC') is not None else ""
     can_gear     = translate_gear(can_signals.get("POS_MONOSTABLE_LEVER"))
-    throttle_val = can_signals.get('EFCMNT_PDLE_ACCEL_228') or can_signals.get('EFCMNT_PDLE_ACCEL_278')
+    throttle_val = can_signals.get('EFCMNT_PDLE_ACCEL_228')
+    if throttle_val is None:
+        throttle_val = can_signals.get('EFCMNT_PDLE_ACCEL_278')
     can_throttle = f"{throttle_val:.1f}%" if throttle_val is not None else ""
     can_battery  = f"{can_signals.get('HV_BATT_TEMP_AVG', 0):.0f}°C" if can_signals.get('HV_BATT_TEMP_AVG') is not None else ""
     can_batt_temp_max = can_signals.get("HV_BATT_TEMP_MAX")  # 电池最高温度 (degC)
@@ -867,6 +1285,31 @@ def step(session):
         "batt_temp_max": round(can_batt_temp_max, 1) if can_batt_temp_max is not None else None,  # 电池最高温度 (数值)
         "d0_status": data.get('D0Status', 'N/A'),
     }
+
+    # ---------- 构造样本写入分段落盘缓冲 ----------
+    # 用原始数值构造样本，ts 用本次 step 的壁钟时间（对齐 RMS 所需时间列）。
+    # 物理量范围过滤（双保险）：即使 simulink_client 已做校验，这里再兜底一次，
+    # 防止切帧错位/脏数据把夸张值写进 CSV。越界值回退为 0，避免污染 RMS 画像。
+    def _sanitize(v, lo, hi, default=0.0):
+        if v is None:
+            return default
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return default
+        return fv if lo <= fv <= hi else default
+
+    _rms_sample = {
+        'ts': now,
+        'speed': _sanitize(speed, -50.0, 300.0),  # 车速 km/h
+        'voltage': _sanitize(can_batt_volt, 0.0, 2000.0),  # 电压 V
+        'current': _sanitize(can_batt_curr, -2000.0, 2000.0),  # 电流 A
+        'soc': _sanitize(can_signals.get('HV_BATT_SOC'), 0.0, 100.0),  # SOC 物理量百分比 0~100
+        'accel_pedal': _sanitize(throttle_val, 0.0, 100.0),  # 油门开度 %
+        'gear': 0,  # 占位（CSV 不导出 gear 列）
+        'temp_max': _sanitize(can_batt_temp_max, -50.0, 150.0),  # 电池最高温度 ℃
+    }
+    _update_rms_buffer(session, now, _rms_sample)
 
     # ---------- 更新所有路段状态 ----------
     segment_states = session['segment_states']
@@ -900,6 +1343,22 @@ def step(session):
         },
         "segments": segment_states,
     }
+
+    # ---------- 挂载 RMS 驾驶画像（style / scenario）供 AI 上位机消费 ----------
+    # 没有新段 flush 的帧保留上一次画像；新画像由后台线程异步算完写回。
+    # 加锁读取，避免与后台 RMS 线程并发写竞争（dict.get 在 GIL 下虽原子，但
+    # 此处连带 .get('style') 需保证读到的是同一份完整对象）。
+    _lock = session.get('rms_lock')
+    if _lock is not None:
+        with _lock:
+            _rms = session.get('rms_result')
+    else:
+        _rms = session.get('rms_result')
+    output_data["rms"] = {
+        "style": _rms.get('style') if _rms else None,
+        "scenario": _rms.get('scenario') if _rms else None,
+    }
+    print(f"[RMS][发出] output_data['rms'] = {output_data['rms']}")
 
     # 两种模式都把原始信号挂上，供车端打印/调试（不影响 AI 主数据 simulink/segments）
     # output_data["can_signals"] = can_signals
@@ -1105,6 +1564,10 @@ def main():
     except KeyboardInterrupt:
         print("\n用户中断")
     finally:
+        # 程序退出时强制把最后一段剩余帧落盘：
+        # 跨度 ≥ 290s 则独立成段；否则并入上一段（避免生成不达标短文件）
+        if not session.get('test_data'):
+            _maybe_flush_segment_csv(session, time.time(), None)
         shutdown_session(session)
 
 

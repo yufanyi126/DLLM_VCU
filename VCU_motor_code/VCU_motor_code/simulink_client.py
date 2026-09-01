@@ -5,20 +5,29 @@
     用于替代真实 CAN 盒，从 Simulink 仿真模型获取车端信号数据。
 
     功能：
-    1. 通过 TCP 连接 Simulink 模型，接收 8 个 double（64 字节）状态数据
+    1. 通过 TCP 连接 Simulink 模型，接收 17 个 double（136 字节）状态数据
     2. 将仿真数据转换为与真实 CAN 信号同名同结构的 dict
     3. 通过 TCP 将控制指令（engy_mode, dyn_mode）发送给 Simulink
 
     数据帧格式（与 simulink_code/code/simlink.py 一致）：
-        接收帧（8 double, 64 字节）:
-            [0] EFCMNT_PDLE_ACCEL       - 油门踏板开度 (%)
-            [1] HV_BATT_TEMP_AVG        - 电池平均温度 (°C)
-            [2] VITESSE_VEHICULE_ROUES  - 车速 (km/h)
-            [3] POS_MONOSTABLE_LEVER    - 档位 (0=P, 1=R, 2=N, 3=D)
-            [4] HV_BATT_SOC             - 电池 SOC (%)
-            [5] STDE_DRV_DYN_MODE_STATE - 驾驶模式 (0=标准, 1=SPORT, 2=ECO)
-            [6] STDE_DRV_ENGY_MODE_STATE- 能量模式 (0=HEV, 1=EV)
-            [7] sim_time                - 仿真时间
+        接收帧（17 double, 136 字节）:
+            [0]  EFCMNT_PDLE_ACCEL       - 油门踏板开度 (%)
+            [1]  HV_BATT_TEMP_AVG        - 电池平均温度 (°C)
+            [2]  VITESSE_VEHICULE_ROUES  - 车速 (km/h)
+            [3]  POS_MONOSTABLE_LEVER    - 档位 (0=P, 1=R, 2=N, 3=D)
+            [4]  HV_BATT_SOC             - 电池 SOC (%)
+            [5]  STDE_DRV_DYN_MODE_STATE - 驾驶模式 (0=标准, 1=SPORT, 2=ECO)
+            [6]  STDE_DRV_ENGY_MODE_STATE- 能量模式 (0=HEV, 1=EV)
+            [7]  sim_time                - 仿真时间
+            [8]  V_target                - 目标速度（暂不消费）
+            [9]  T_Engine                - 发动机扭矩（暂不消费）
+            [10] RPM_Engine              - 发动机转速（暂不消费）
+            [11] T_Motor                 - 电机扭矩（暂不消费）
+            [12] RPM_Motor               - 电机转速（暂不消费）
+            [13] HV_BATT_TEMP            - 电池实时温度（暂不消费）
+            [14] HV_BATT_TEMP_MAX        - 电池最高温度 (°C) ← 需要
+            [15] Current                 - 电池电流 (A)     ← 需要（键名对齐 main.py）
+            [16] Voltage                 - 电池电压 (V)     ← 需要（键名对齐 main.py）
 
         发送帧（2 double, 16 字节）:
             (dyn_mode, engy_mode)
@@ -30,21 +39,45 @@ import threading
 import time
 
 
-# ===== 信号字段名列表（按 Simulink 帧解析顺序） =====
+# ===== 信号字段名列表（按 Simulink 帧解析顺序，共 17 个 double） =====
 _SIGNAL_KEYS = [
-    "EFCMNT_PDLE_ACCEL_228",     # 油门踏板开度（与真实 CAN 的 0x228 信号名对齐）
-    "HV_BATT_TEMP_AVG",          # 电池平均温度
-    "VITESSE_VEHICULE_ROUES",    # 车速
-    "POS_MONOSTABLE_LEVER",      # 档位
-    "HV_BATT_SOC",               # 电池 SOC
-    "STDE_DRV_DYN_MODE_STATE",   # 驾驶模式
-    "STDE_DRV_ENGY_MODE_STATE",  # 能量模式
-    "_sim_time",                 # 仿真时间（内部使用）
+    "EFCMNT_PDLE_ACCEL_228",     # [0]  油门踏板开度（与真实 CAN 的 0x228 信号名对齐）
+    "HV_BATT_TEMP_AVG",          # [1]  电池平均温度（显示用，保持原样不动）
+    "VITESSE_VEHICULE_ROUES",    # [2]  车速
+    "POS_MONOSTABLE_LEVER",      # [3]  档位
+    "HV_BATT_SOC",               # [4]  电池 SOC
+    "STDE_DRV_DYN_MODE_STATE",   # [5]  驾驶模式
+    "STDE_DRV_ENGY_MODE_STATE",  # [6]  能量模式
+    "_sim_time",                 # [7]  仿真时间（内部使用）
+    "_unused_v_target",          # [8]  目标速度（暂不消费）
+    "_unused_t_engine",          # [9]  发动机扭矩（暂不消费）
+    "_unused_rpm_engine",        # [10] 发动机转速（暂不消费）
+    "_unused_t_motor",           # [11] 电机扭矩（暂不消费）
+    "_unused_rpm_motor",         # [12] 电机转速（暂不消费）
+    "_unused_hv_batt_temp",      # [13] 电池实时温度（暂不消费）
+    "HV_BATT_TEMP_MAX",          # [14] 电池最高温度 (°C) ← 需要（键名对齐 main.py）
+    "HV_BATT_REAL_CURR_HD",      # [15] 电池电流 (A)     ← 需要（键名对齐 main.py）
+    "HV_BATT_REAL_VOLT_HD",      # [16] 电池电压 (V)     ← 需要（键名对齐 main.py）
 ]
 
 # 真实 CAN 信号中，油门踏板有两个可能的信号名（0x228 / 0x278），
 # 仿真模式下同时填充两者，保证 main.py 中的兼容性读取都能命中。
 _THROTTLE_ALIAS_KEYS = ["EFCMNT_PDLE_ACCEL_228", "EFCMNT_PDLE_ACCEL_278"]
+
+# ===== 物理量范围校验（兜底） =====
+# 当 Test.py 5001 转发的字节流发生切帧错位时，struct.unpack('<17d', ...)
+# 会把任意 8 字节当 double 解释，解出的值经常远超物理合理范围。
+# 这里在更新 _latest_signals 前做一次范围过滤，错位帧直接丢弃，避免垃圾值进入 main.py / CSV。
+# 索引对应 _SIGNAL_KEYS：
+#   [2]  车速 km/h        [4] SOC %      [14] 最高温度 ℃
+#   [15] 电流 A           [16] 电压 V
+_PHYS_RANGES = {
+    2: (-10.0, 300.0),    # VITESSE_VEHICULE_ROUES 车速 -10~300 km/h
+    4: (0.0, 100.0),      # HV_BATT_SOC 0~100 %
+    14: (-50.0, 150.0),   # HV_BATT_TEMP_MAX -50~150 ℃
+    15: (-2000.0, 2000.0),# Current -2000~2000 A（留裕量，主防极端错位值）
+    16: (0.0, 2000.0),    # Voltage 0~2000 V
+}
 
 
 class SimulinkClient:
@@ -63,12 +96,12 @@ class SimulinkClient:
 
     def __init__(self, recv_host="127.0.0.1", recv_port=6000,
                  send_host="127.0.0.1", send_port=7000,
-                 frame_size=64):
+                 frame_size=136):
         self.recv_host = recv_host
         self.recv_port = recv_port
         self.send_host = send_host
         self.send_port = send_port
-        self.frame_size = frame_size  # 8 * 8 字节
+        self.frame_size = frame_size  # 17 * 8 字节（含电流/电压/最高温度）
 
         self._recv_sock = None
         self._send_sock = None
@@ -76,6 +109,12 @@ class SimulinkClient:
         self._latest_signals = {}
         self._running = False
         self._recv_thread = None
+
+        # STDE_MODE_REQ_BIT_TGL 翻转信号（与 CANFDNET.py 规则一致：ENGY/DYN 任一变化时翻转）
+        self._tgl = 0
+        self._tgl_lock = threading.Lock()
+        self._last_engy = None
+        self._last_dyn = None
 
     # ==================== 连接管理 ====================
 
@@ -157,12 +196,20 @@ class SimulinkClient:
                 self._parse_frame(frame)
 
     def _parse_frame(self, frame):
-        """解析一帧 64 字节数据（8 个 double），更新最新信号值"""
+        """解析一帧 136 字节数据（17 个 double），更新最新信号值"""
         try:
-            values = struct.unpack("<8d", frame)
+            values = struct.unpack("<17d", frame)
         except struct.error:
             print(f"[Simulink] 帧解析失败，帧长={len(frame)}")
             return
+
+        # 物理量范围校验：错位帧解出的 double 常超出物理合理范围，直接丢弃，
+        # 避免把垃圾值带进 main.py 和 RMS 落盘 CSV。
+        for idx, (lo, hi) in _PHYS_RANGES.items():
+            v = values[idx]
+            if not (lo <= v <= hi):
+                print(f"[Simulink] 帧校验失败: _SIGNAL_KEYS[{idx}]={v} 超出范围 [{lo},{hi}]，丢弃本帧")
+                return
 
         signals = {}
         for i, key in enumerate(_SIGNAL_KEYS):
@@ -211,7 +258,18 @@ class SimulinkClient:
             engy_mode: 能量模式 (0=HEV, 1=EV)
             dyn_mode:  驾驶模式 (0=标准, 1=SPORT, 2=ECO)
         """
+        # 模拟 STDE_MODE_REQ_BIT_TGL：与 CANFDNET.py 规则完全一致，
+        # 任一模式指令（ENGY/DYN）变化时翻转；首次下发（last 为 None）不翻转，仅记录初值。
+        engy_int, dyn_int = int(engy_mode), int(dyn_mode)
+        with self._tgl_lock:
+            if self._last_engy is not None and self._last_dyn is not None:
+                if engy_int != self._last_engy or dyn_int != self._last_dyn:
+                    self._tgl ^= 1
+            self._last_engy = engy_int
+            self._last_dyn = dyn_int
+            tgl_val = self._tgl
+
         ok = self._send_packed(dyn_mode, engy_mode)
         if ok:
-            print(f"[Simulink] 已下发控制: engy_mode={engy_mode}, dyn_mode={dyn_mode}")
+            print(f"[Simulink] 已下发控制: engy_mode={engy_mode}, dyn_mode={dyn_mode}, TGL={tgl_val}")
         return ok

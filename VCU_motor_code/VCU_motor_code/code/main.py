@@ -56,6 +56,21 @@ _API_STATUS_DATA = {        # 实时状态（主循环每次更新）
     'gps_lost': False, 'accumulated_dist': 0,
     'sat_count': 0, 'hdop': 0.0,
 }
+
+# ============ 历史数据缓冲区（用于 GPS 仪表盘曲线图） ============
+_HISTORY_DATA = {
+    'timestamps': [],
+    'progress_pct': [],
+    'remaining_km': [],
+    'speed': [],
+    'lat': [],
+    'lng': [],
+    'gps_valid': [],
+    'api_refresh': [],        # 标记 API 路况刷新时间点
+    'current_step': [],
+    'traffic': [],
+}
+_MAX_HISTORY = 300  # 最多保留 300 条历史记录
 # =======================================
 
 
@@ -195,6 +210,7 @@ def get_simulated_speed():
 # ========== HTTP 服务器 ==========
 
 _HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'driving_route.html')
+_DASHBOARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'gps_dashboard.html')
 
 
 class _RouteAPIHandler(BaseHTTPRequestHandler):
@@ -204,10 +220,14 @@ class _RouteAPIHandler(BaseHTTPRequestHandler):
         try:
             if self.path == '/' or self.path == '/index.html':
                 self._serve_html()
+            elif self.path == '/dashboard':
+                self._serve_dashboard()
             elif self.path == '/api/route':
                 self._serve_json(_API_ROUTE_DATA)
             elif self.path == '/api/status':
                 self._serve_json(_API_STATUS_DATA)
+            elif self.path == '/api/history':
+                self._serve_json(_HISTORY_DATA)
             else:
                 self.send_error(404)
         except Exception:
@@ -224,6 +244,18 @@ class _RouteAPIHandler(BaseHTTPRequestHandler):
             self.wfile.write(html.encode('utf-8'))
         except FileNotFoundError:
             self.send_error(404, 'driving_route.html not found')
+
+    def _serve_dashboard(self):
+        try:
+            with open(_DASHBOARD_PATH, 'r', encoding='utf-8') as f:
+                html = f.read()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(html.encode('utf-8'))))
+            self.end_headers()
+            self.wfile.write(html.encode('utf-8'))
+        except FileNotFoundError:
+            self.send_error(404, 'gps_dashboard.html not found')
 
     def _serve_json(self, data):
         body = json.dumps(data, ensure_ascii=False)
@@ -366,6 +398,29 @@ def _update_http_status(data, gps_valid, speed, step, progress, tracker, lat, lo
     })
 
 
+def _append_history(gps_valid, speed, step, progress, tracker, lat, lon, is_api_refresh=False):
+    """将当前状态追加到历史数据缓冲区（用于 GPS 仪表盘曲线图）"""
+    import datetime
+    remaining_km = max(0, (tracker.original_total_distance - tracker.cumulative_distance) / 1000)
+    hist = _HISTORY_DATA
+
+    hist['timestamps'].append(datetime.datetime.now().strftime('%H:%M:%S'))
+    hist['progress_pct'].append(round(progress, 1))
+    hist['remaining_km'].append(round(remaining_km, 2))
+    hist['speed'].append(round(speed, 1))
+    hist['lat'].append(lat if lat else None)
+    hist['lng'].append(lon if lon else None)
+    hist['gps_valid'].append(gps_valid)
+    hist['api_refresh'].append(is_api_refresh)
+    hist['current_step'].append(step['step_index'] if step else 0)
+    hist['traffic'].append(step['traffic'] if step else '')
+
+    # 裁剪：只保留最近 _MAX_HISTORY 条
+    if len(hist['timestamps']) > _MAX_HISTORY:
+        for key in hist:
+            hist[key] = hist[key][-_MAX_HISTORY:]
+
+
 def main():
     """
     主循环：
@@ -456,6 +511,7 @@ def main():
                 tracker.dead_reckon(speed, now)
 
             # ---------- API 路况刷新 ----------
+            api_refresh_this_cycle = False
             if now - last_api_refresh > API_REFRESH_INTERVAL:
                 # GPS 无效时不执行刷新（没有可靠起点坐标）
                 if gps_valid and lat is not None and lon is not None:
@@ -477,6 +533,7 @@ def main():
                                 _API_ROUTE_DATA['steps'] = route_steps
                                 _API_ROUTE_DATA['total_distance'] = tracker.original_total_distance
                                 _API_STATUS_DATA['total_steps'] = len(route_steps)
+                                api_refresh_this_cycle = True
                                 print("[刷新] 路况已更新")
                             else:
                                 print("[刷新] build_route_steps 返回空")
@@ -505,6 +562,10 @@ def main():
             # ---------- 更新 HTTP 共享状态 ----------
             _update_http_status(data, gps_valid, speed, step, progress,
                                 tracker, lat, lon)
+
+            # ---------- 追加历史数据（供 GPS 仪表盘使用） ----------
+            _append_history(gps_valid, speed, step, progress, tracker, lat, lon,
+                            is_api_refresh=api_refresh_this_cycle)
 
             time.sleep(2)  # 10Hz - 0.1s
 

@@ -23,27 +23,34 @@ server_sockets = {}
 
 
 
-def handle_client_5001(client_socket, address):
-    
+FRAME_SIZE_5001 = 136  # 17 个 double，对齐 simulink_client.py / Receive.py
 
+
+def handle_client_5001(client_socket, address):
     print(f"[端口 5001] Simulink 状态发送模块 {address} 已连接")
     with port_5001_clients_lock:
         port_5001_clients.append(client_socket)
-        
+
+    # TCP 是字节流，必须累积 buffer 按 136 字节切帧，
+    # 否则一次 recv 返回非 136 整数倍长度时，残留字节被丢弃，
+    # 导致所有 6000 客户端（Receive.py / simulink_client.py）的 buffer 永久错位。
+    buffer = b""
     try:
         while True:
             data = client_socket.recv(1024)
             if not data: break
-                
-            if len(data) >= 136:
+
+            buffer += data
+            while len(buffer) >= FRAME_SIZE_5001:
+                frame = buffer[:FRAME_SIZE_5001]
+                buffer = buffer[FRAME_SIZE_5001:]
                 with ui_clients_lock:
                     for ui_sock in ui_clients[:]:
                         try:
-                            ui_sock.sendall(data[:136])
+                            ui_sock.sendall(frame)
                         except:
                             ui_clients.remove(ui_sock)
-                            
-                      
+
     except Exception as e:
         print(f"\n[端口 5001] 解析出错: {e}")
     finally:

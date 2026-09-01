@@ -43,7 +43,9 @@ def handle_client_5001(client_socket, address):
         while True:
             data = client_socket.recv(1024)
             if not data: break
-                
+
+            print(f"[5001] 收到 {len(data)} 字节")
+
             if len(data) >= 64:
                 with ui_clients_lock:
                     for ui_sock in ui_clients[:]:

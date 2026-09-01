@@ -13,6 +13,7 @@ import os
 import asyncio
 import json
 import argparse
+import threading
 import websockets
 
 # ===== 路径配置（与 main.py 保持一致）=====
@@ -88,7 +89,13 @@ def parse_control_command(msg):
 async def handle_control_command(action, cmd, session):
     """根据 action 执行对应的控制操作"""
     if action == 'decision':
-        session['last_llm_decision'] = cmd
+        # recv_loop 与 step 线程并发访问 session，写共享字段加锁保护。
+        _lock = session.get('_lock')
+        if _lock is not None:
+            with _lock:
+                session['last_llm_decision'] = cmd
+        else:
+            session['last_llm_decision'] = cmd
         control = cmd.get('control_command') if isinstance(cmd, dict) else None
 
         print(f"[车端] 已接收 LLM 决策 packet: current_segment={cmd.get('current_segment') if isinstance(cmd, dict) else None}")
@@ -156,9 +163,14 @@ async def handler(websocket, session):
     recv_task = asyncio.create_task(recv_loop())
 
     # 主循环：采集 CAN/GPS 数据 → 推送给上位机
+    # step() 内部已把 RMS 画像计算改为后台线程，此处再用 to_thread 把整个 step
+    # 移出事件循环，避免任何（如 CAN 读取/CSV 落盘）阻塞导致 recv_loop 收不到 AI 回传。
+    # session 由 step(线程) 与 recv_loop(事件循环) 并发访问，用一把全局锁串行化写操作。
+    _lock = session.setdefault('_lock', threading.Lock())
+
     try:
         while not session.get('finished'):
-            output = step(session)
+            output = await asyncio.to_thread(step, session)
             if output is None:
                 if session.get('finished'):
                     # 发送完成通知
@@ -248,17 +260,18 @@ async def car_main(origin_addr=None, dest_addr=None, port=WS_PORT):
 if __name__ == '__main__':
     # ===== 手动配置：修改下面变量即可 =====
     MY_PORT = 8765                                   # WebSocket 端口
-    MY_ORIGIN = "106.830767,29.716379"               # 起点坐标 (lng,lat)
-    MY_DEST = "106.834505,29.715720"                 # 终点坐标 (lng,lat)
-    # MY_ORIGIN = "121.204403,31.416822"  # 起点坐标 (lng,lat) '121.204403,31.416822','121.322861,31.194331'
-    # MY_DEST = "121.322861,31.194331"  # 终点坐标 (lng,lat)
+    # MY_ORIGIN = "106.830767,29.716379"               # 起点坐标 (lng,lat)
+    # MY_DEST = "106.55,29.61"                 # 终点坐标 (lng,lat)  106.834505,29.715720   "106.80,29.69"
+    MY_ORIGIN = "121.204403,31.416822"  # 起点坐标 (lng,lat) '121.204403,31.416822','121.322861,31.194331'
+    MY_DEST = "121.322861,31.194331"  # 终点坐标 (lng,lat)
     # True 时 main.py 发送内置测试数据，不初始化真实 GPS/CAN/高德 API。
     MY_USE_MAIN_TEST_DATA = False
     # =====================================
 
     if MY_USE_MAIN_TEST_DATA:
-        # main.init_session() 在运行时读取此开关，供本机端到端手动测试使用。
-        os.environ["VCU_MAIN_TEST_DATA"] = "1"
+        # 直接开启 main 的测试数据开关，供本机端到端手动测试使用。
+        import main
+        main.MAIN_TEST_DATA_SWITCH = True
 
     try:
         asyncio.run(car_main(

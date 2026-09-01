@@ -3,7 +3,7 @@
     simulink_server.py — 纯仿真 WebSocket 服务端 (替代原 car_server.py)
     ====================================================================
     运行逻辑：
-    1. 启动 TCP 6000 客户端，接收 Simulink 传来的 13个 double (104字节) 状态数据。
+    1. 启动 TCP 6000 客户端，接收 Simulink 传来的 17个 double (136字节) 状态数据。
     2. 启动 TCP 7000 客户端，负责向 Simulink 发送控制指令。
     3. 启动 WebSocket 8765 服务端，供上位机 AI (receive_demo.py) 连接。
     4. 将 Simulink 数据包装成假的路况格式，发给 AI；并将 AI 的指令发给 Simulink。
@@ -23,8 +23,8 @@ TCP_SEND_HOST = '127.0.0.1'
 TCP_SEND_PORT = 7000   # 往 Simulink 发控制 (2 double)
 
 TCP_RECV_HOST = '127.0.0.1'
-TCP_RECV_PORT = 6000   # 从 Simulink 收状态 (13 double)
-FRAME_SIZE = 64       # 13 * 8 字节
+TCP_RECV_PORT = 6000   # 从 Simulink 收状态 (17 double)
+FRAME_SIZE = 136      # 17 * 8 字节
 # ========================
 
 
@@ -66,7 +66,7 @@ async def tcp_send_worker(session):
 
 
 async def tcp_receiver_worker(session):
-    """TCP 上行：连接 6000 端口，持续接收 Simulink 的 104 字节状态数据"""
+    """TCP 上行：连接 6000 端口，持续接收 Simulink 的 136 字节状态数据"""
     while True:
         reader, writer = None, None
         buffer = b''
@@ -91,7 +91,7 @@ async def tcp_receiver_worker(session):
                     frame = buffer[:FRAME_SIZE]
                     buffer = buffer[FRAME_SIZE:]
 
-                    unpacked = struct.unpack('<8d', frame)
+                    unpacked = struct.unpack('<17d', frame)
                     sim_time = unpacked[7]
                     
                     # 组装 Simulink 数据字典 (提取 AI 关心的字段)
@@ -104,6 +104,9 @@ async def tcp_receiver_worker(session):
                         "STDE_DRV_DYN_MODE_STATE": unpacked[5],
                         "STDE_DRV_ENGY_MODE_STATE": unpacked[6],
                         "sim_time":                sim_time,
+                        "HV_BATT_TEMP_MAX":        unpacked[14],
+                        "HV_BATT_REAL_CURR_HD":    unpacked[15],
+                        "HV_BATT_REAL_VOLT_HD":    unpacked[16],
                     }
                     session['latest_sim_data'] = sim_data
 
